@@ -810,10 +810,6 @@ int in_sched_functions(unsigned long addr)
 	        addr < (unsigned long)__sched_text_end);
 }
 
-/* --------------------------------------------------------------------------
- * config_key support helpers
- * -------------------------------------------------------------------------- */
-
 static struct configfs_attribute *config_key_attrs[] = {
 	&config_key_attr_description,
 	NULL,
@@ -893,17 +889,15 @@ static void irq_cpu_rmap_release(struct irq_affinity_notify *notify)
 }
 EXPORT_SYMBOL(irq_cpu_rmap_release);
 
-
 int cpu_rmap_init(struct cpu_rmap *rmap)
 {
-	int cpu;
-
-	if (!rmap)
+	if (unlikely(!rmap))
 		return -EINVAL;
 
+	memset(rmap->near, 0xFF, sizeof(rmap->near));
+
 	for_each_possible_cpu(cpu) {
-		rmap->near[cpu].index = U16_MAX;
-		rmap->near[cpu].dist  = CPU_RMAP_DIST_INF;
+		rmap->near[cpu].dist = CPU_RMAP_DIST_INF;
 	}
 
 	return 0;
@@ -914,15 +908,15 @@ int irq_cpu_rmap_unregister(struct cpu_rmap *rmap, unsigned int index)
 {
 	struct irq_glue *glue;
 
-	if (!rmap || index >= nr_cpu_ids)
+	if (unlikely(!rmap) || unlikely(index >= nr_cpu_ids))
 		return -EINVAL;
 
 	glue = rmap->obj ? rmap->obj[index] : NULL;
-	if (!glue)
+	if (unlikely(!glue))
 		return -ENOENT;
 
-	rmap->obj[index] = NULL;
 	irq_cpu_rmap_release(&glue->notify);
+	rmap->obj[index] = NULL;
 
 	return 0;
 }
@@ -931,23 +925,26 @@ EXPORT_SYMBOL(irq_cpu_rmap_unregister);
 static inline void sched_diag_record_io_wait(u64 delta)
 {
 	struct sched_diag *diag = this_cpu_ptr(&cpu_sched_diag);
+
+	if (!delta)
+		return;
+
 	raw_spin_lock(&diag->lock);
 	diag->total_io_wait_ns += delta;
 	diag->io_wait_count++;
 	raw_spin_unlock(&diag->lock);
 }
 
-
 void io_schedule_complete(int old_iowait)
 {
 #ifdef CONFIG_SCHED_DEBUG
-	static DEFINE_PER_CPU(u64, io_wait_start_ns);
-	u64 now = ktime_get_ns();
-	u64 delta = now - this_cpu_read(io_wait_start_ns);
+	u64 start = this_cpu_read(io_wait_start_ns);
+	u64 now   = ktime_get_ns();
+	u64 delta = now - start;
 
 	sched_diag_record_io_wait(delta);
 
-	pr_debug("[io_sched] PID:%d (%s) waited %llu ns for I/O\n",
+	pr_debug("[io] complete PID:%d %s waited %llu ns\n",
 		 current->pid, current->comm,
 		 (unsigned long long)delta);
 #endif
@@ -956,90 +953,89 @@ void io_schedule_complete(int old_iowait)
 }
 EXPORT_SYMBOL(io_schedule_complete);
 
-#ifdef CONFIG_NUMA
 
+#ifdef CONFIG_NUMA
 int numa_cpu_rmap_balance(struct cpu_rmap *rmap)
 {
-	int cpu, node;
-	int count = 0;
+	int cpu, count = 0;
+	int local_node;
 
-	if (!rmap)
+	if (unlikely(!rmap))
 		return -EINVAL;
 
+	local_node = numa_node_id();
+
 	for_each_online_cpu(cpu) {
-		node = cpu_to_node(cpu);
-		rmap->near[cpu].dist = node_distance(node, numa_node_id());
+		int node = cpu_to_node(cpu);
+
+		rmap->near[cpu].dist = node_distance(node, local_node);
 		count++;
 	}
 
-	pr_debug("[rmap] NUMA rebalance updated %d CPUs\n", count);
+	pr_debug("[rmap] NUMA rebalance: %d updated\n", count);
 	return 0;
 }
 EXPORT_SYMBOL(numa_cpu_rmap_balance);
 #endif /* CONFIG_NUMA */
 
-
 #ifdef CONFIG_LOCK_STAT
-
-struct lockstat_info {
-	u64 acquire_count;
-	u64 contention_count;
-	u64 total_wait_ns;
-};
-
-static DEFINE_PER_CPU(struct lockstat_info, cpu_lockstat);
-
 void sched_lockstat_acquire_start(void)
 {
-	struct lockstat_info *info = this_cpu_ptr(&cpu_lockstat);
-	info->acquire_count++;
+	this_cpu_inc(cpu_lockstat.acquire_count);
 }
 
 void sched_lockstat_contention(u64 wait_ns)
 {
 	struct lockstat_info *info = this_cpu_ptr(&cpu_lockstat);
+
 	info->contention_count++;
 	info->total_wait_ns += wait_ns;
 }
 #endif /* CONFIG_LOCK_STAT */
 
-#ifdef CONFIG_PROC_FS
 
+#ifdef CONFIG_PROC_FS
+/* /proc scheduler diagnostics
+ * Rewritten:
+ *  - precompute values before formatting
+ *  - no redundant reads inside loop
+*/
 static int sched_diag_show(struct seq_file *m, void *v)
 {
 	int cpu;
 
 	seq_puts(m, "=== Scheduler Diagnostics ===\n");
+
 	for_each_online_cpu(cpu) {
 		struct sched_diag *d = &per_cpu(cpu_sched_diag, cpu);
-		u64 avg_wait = 0;
-
-		if (d->io_wait_count)
-			avg_wait = div64_u64(d->total_io_wait_ns, d->io_wait_count);
+		u64 avg = d->io_wait_count ?
+			div64_u64(d->total_io_wait_ns, d->io_wait_count) : 0;
 
 		seq_printf(m,
-			"CPU %d: I/O waits=%llu, total=%llu ns, avg=%llu ns, switches=%llu\n",
+			"CPU %d: I/O=%llu total=%llu ns avg=%llu ns switches=%llu\n",
 			cpu,
 			(unsigned long long)d->io_wait_count,
 			(unsigned long long)d->total_io_wait_ns,
-			(unsigned long long)avg_wait,
+			(unsigned long long)avg,
 			(unsigned long long)d->rq_switch_count);
 	}
 
 #ifdef CONFIG_LOCK_STAT
 	for_each_online_cpu(cpu) {
 		struct lockstat_info *l = &per_cpu(cpu_lockstat, cpu);
+
 		seq_printf(m,
-			"CPU %d: locks=%llu, contended=%llu, total_wait=%llu ns\n",
+			"CPU %d: locks=%llu contended=%llu wait=%llu ns\n",
 			cpu,
 			(unsigned long long)l->acquire_count,
 			(unsigned long long)l->contention_count,
 			(unsigned long long)l->total_wait_ns);
 	}
 #endif
-
 	return 0;
 }
+#endif
+
 
 static int sched_diag_open(struct inode *inode, struct file *file)
 {
