@@ -1,10 +1,11 @@
-// RAM Disk Loader
-// This module provides functionality for detecting, decompressing, and
-// loading various types of RAM disk images (e.g., romfs, cramfs, squashfs,
-// minix, ext2) into memory at boot time. It supports both uncompressed and
-// compressed images, automatically selecting the appropriate decompression
-// method when required.
- 
+/*
+ * RAM Disk Loader
+ * This module provides functionality for detecting, decompressing, and
+ * loading various types of RAM disk images (e.g., romfs, cramfs, squashfs,
+ * minix, ext2) into memory at boot time. It supports both uncompressed and
+ * compressed images, automatically selecting the appropriate decompression
+ * method when required.
+ */
 #include <linux/root_dev.h>
 #include <linux/security.h>
 #include <linux/delay.h>
@@ -287,71 +288,60 @@ out:
 	return res;
 }
 
-/*
- * kcmp_lock - acquire two rw_semaphores in a deadlock-safe order
- *
- * Locks are always taken in pointer-sorted order (lowest first).
- * If both arguments are the same, only a single lock is taken.
- *
- * Returns 0 on success, -EINTR if interrupted.
- */
 static int kcmp_lock(struct rw_semaphore *l1, struct rw_semaphore *l2)
 {
 	struct rw_semaphore *first, *second;
-	int err;
+	int ret;
 
-	if (l1 == l2) {
-		/* Same lock: acquire once */
+	/* Single lock shortcut */
+	if (l1 == l2)
 		return down_read_killable(l1);
-	}
 
-	/* Order locks by pointer address to prevent ABBA deadlock */
-	if (l1 < l2) {
-		first  = l1;
-		second = l2;
-	} else {
-		first  = l2;
-		second = l1;
-	}
+	/* pointer ordering (min/max trick) */
+	first  = (struct rw_semaphore *)((unsigned long)l1 & -(l1 < l2)) |
+	         (struct rw_semaphore *)((unsigned long)l2 & -(l2 <= l1));
+	second = (struct rw_semaphore *)((unsigned long)l1 ^ (unsigned long)l2 ^ (unsigned long)first);
 
-	err = down_read_killable(first);
-	if (err)
-		return err;
+	/* Acquire first lock (killable) */
+	ret = down_read_killable(first);
+	if (ret)
+		return ret;
 
-	err = down_read_killable_nested(second, SINGLE_DEPTH_NESTING);
-	if (err) {
+	/* Acquire second lock nested */
+	ret = down_read_killable_nested(second, SINGLE_DEPTH_NESTING);
+	if (ret) {
 		up_read(first);
-		return err;
+		return ret;
 	}
 
-	/* Ensure lock ordering visible across CPUs */
-	smp_rmb();
+	smp_rmb(); /* Ensure lock ordering visible across CPUs */
 	return 0;
 }
 
-/*
+/**
  * kcmp_unlock - release two rw_semaphores in reverse order
+ * @l1, l2: locks to release
  *
- * Unlock is symmetric with lock: if both args are the same,
- * release only once. Otherwise release in reverse acquisition order.
+ * Unlocks deterministically using XOR trick to compute reverse order.
  */
 static void kcmp_unlock(struct rw_semaphore *l1, struct rw_semaphore *l2)
 {
+	struct rw_semaphore *first, *second;
+
 	if (l1 == l2) {
 		up_read(l1);
 		return;
 	}
 
-	/* Unlock in reverse pointer-sorted order */
-	if (l1 < l2) {
-		up_read(l2);
-		up_read(l1);
-	} else {
-		up_read(l1);
-		up_read(l2);
-	}
-}
+	/* Compute sorted order */
+	first  = (struct rw_semaphore *)((unsigned long)l1 & -(l1 < l2)) |
+	         (struct rw_semaphore *)((unsigned long)l2 & -(l2 <= l1));
+	second = (struct rw_semaphore *)((unsigned long)l1 ^ (unsigned long)l2 ^ (unsigned long)first);
 
+	/* Reverse unlock using XOR trick (swap order) */
+	up_read(second);
+	up_read(first);
+}
 
 #ifdef CONFIG_EPOLL
 static int kcmp_epoll_target(struct task_struct *task1,
