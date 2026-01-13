@@ -558,12 +558,10 @@ static void __init error(const char *msg)
 
 /*
  * radix_tree_find_next_bit:
- *
+ 
  * Find the next set bit in node->tags[tag] at or after @offset.
  * Returns the bit index in [0, RADIX_TREE_MAP_SIZE), or RADIX_TREE_MAP_SIZE
  * if no bit is set after @offset or on invalid input.
- *
- * This implementation is robust: it checks tag bounds, tag presence,
  *  READ_ONCE for word reads, and clamps results to RADIX_TREE_MAP_SIZE.
  */
 static __always_inline unsigned long
@@ -572,13 +570,10 @@ radix_tree_find_next_bit(struct radix_tree_node *node, unsigned int tag,
 {
 	const unsigned long *map;
 	unsigned long map_size = RADIX_TREE_MAP_SIZE;
-	unsigned int nwords;
-	unsigned int word_idx;
-	unsigned int bit_idx;
-	unsigned long tmp;
-	unsigned long result;
+	unsigned int nwords, word_idx, bit_idx;
+	unsigned long tmp, mask;
+	unsigned long result = map_size;
 
-	/* Basic validation */
 	if (!node || tag >= RADIX_TREE_TAGS)
 		return map_size;
 
@@ -589,31 +584,23 @@ radix_tree_find_next_bit(struct radix_tree_node *node, unsigned int tag,
 	if (offset >= map_size)
 		return map_size;
 
-	/* number of machine words used for the tag map */
-	nwords = BITS_TO_LONGS(map_size);
-
-	/* start at word and bit within the word */
+	nwords   = BITS_TO_LONGS(map_size);
 	word_idx = offset / BITS_PER_LONG;
 	bit_idx  = offset % BITS_PER_LONG;
+	mask = ~0UL << bit_idx;
+	tmp = READ_ONCE(map[word_idx]) & mask;
+	/* word offset + ffs */
+	result = tmp ? (word_idx * BITS_PER_LONG + __ffs(tmp))
+		     : map_size;
 
-	/* first word: shift right by bit_idx so lowest set bit >= offset will show */
-	tmp = READ_ONCE(map[word_idx]) >> bit_idx;
-	if (tmp) {
-		result = word_idx * BITS_PER_LONG + __ffs(tmp);
-		return (result < map_size) ? result : map_size;
-	}
-
-	/* scan remaining words */
-	for (word_idx = word_idx + 1; word_idx < nwords; word_idx++) {
+	for (word_idx++; word_idx < nwords && result == map_size; word_idx++) {
 		tmp = READ_ONCE(map[word_idx]);
-		if (tmp) {
-			result = word_idx * BITS_PER_LONG + __ffs(tmp);
-			return (result < map_size) ? result : map_size;
-		}
+		result = tmp ? (word_idx * BITS_PER_LONG + __ffs(tmp)) : map_size;
 	}
 
-	return map_size;
+	return (result < map_size) ? result : map_size;
 }
+
 
 /* iter_offset: return the offset within a radix-tree map for an iterator. */
 static unsigned int iter_offset(const struct radix_tree_iter *iter)
