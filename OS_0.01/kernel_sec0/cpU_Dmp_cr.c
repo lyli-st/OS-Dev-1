@@ -554,48 +554,60 @@ void double_rq_lock(struct rq *rq1, struct rq *rq2)
 	double_rq_clock_clear_update(rq1, rq2);
 }
 
-struct rq *__task_rq_lock(struct task_struct *p, struct rq_flags *rf)
-	__acquires(rq->lock)
+/*
+ * will return the rq owning @p once both pi_lock and rq->lock are stable
+ * and @p isn't migrating. Uses a single retry path to avoid
+ * duplicated logic.
+ */
+static __always_inline struct rq *
+__rq_acquire_if_stable(struct task_struct *p, struct rq_flags *rf, bool with_pilock)
 {
 	struct rq *rq;
 
-	lockdep_assert_held(&p->pi_lock);
-
 	for (;;) {
+		if (with_pilock)
+			raw_spin_lock_irqsave(&p->pi_lock, rf->flags);
+
 		rq = task_rq(p);
 		raw_spin_rq_lock(rq);
+
+		/*
+		 * Verifies that:
+		 *  1) rq didn't change under us
+		 *  2) p isn't in a migration window
+		 */
 		if (likely(rq == task_rq(p) && !task_on_rq_migrating(p))) {
 			rq_pin_lock(rq, rf);
 			return rq;
 		}
-		raw_spin_rq_unlock(rq);
 
+		/* Unwind and retry */
+		raw_spin_rq_unlock(rq);
+		if (with_pilock)
+			raw_spin_unlock_irqrestore(&p->pi_lock, rf->flags);
+
+		/* Wait for migration to finish, outside lock */
 		while (unlikely(task_on_rq_migrating(p)))
 			cpu_relax();
 	}
+}
+
+struct rq *__task_rq_lock(struct task_struct *p, struct rq_flags *rf)
+	__acquires(rq->lock)
+{
+	lockdep_assert_held(&p->pi_lock);
+
+	/* pi_lock already held; do not touch interrupts */
+	return __rq_acquire_if_stable(p, rf, false);
 }
 
 struct rq *task_rq_lock(struct task_struct *p, struct rq_flags *rf)
 	__acquires(p->pi_lock)
 	__acquires(rq->lock)
 {
-	struct rq *rq;
-
-	for (;;) {
-		raw_spin_lock_irqsave(&p->pi_lock, rf->flags);
-		rq = task_rq(p);
-		raw_spin_rq_lock(rq);
-		if (likely(rq == task_rq(p) && !task_on_rq_migrating(p))) {
-			rq_pin_lock(rq, rf);
-			return rq;
-		}
-		raw_spin_rq_unlock(rq);
-		raw_spin_unlock_irqrestore(&p->pi_lock, rf->flags);
-
-		while (unlikely(task_on_rq_migrating(p)))
-			cpu_relax();
-	}
+	return __rq_acquire_if_stable(p, rf, true);
 }
+
 
 static void update_rq_clock_task(struct rq *rq, s64 delta)
 {
