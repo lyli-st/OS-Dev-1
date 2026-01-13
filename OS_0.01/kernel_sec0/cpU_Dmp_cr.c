@@ -558,7 +558,7 @@ void double_rq_lock(struct rq *rq1, struct rq *rq2)
  * will return the rq owning @p once both pi_lock and rq->lock are stable
  * and @p isn't migrating. Uses a single retry path to avoid
  * duplicated logic.
- */
+ */	
 static __always_inline struct rq *
 __rq_acquire_if_stable(struct task_struct *p, struct rq_flags *rf, bool with_pilock)
 {
