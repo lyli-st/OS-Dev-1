@@ -395,31 +395,42 @@ static void sched_core_unlock(int cpu, unsigned long *flags)
 static void __sched_core_flip(bool enabled)
 {
 	unsigned long flags;
-	int cpu, t;
+	int cpu, sib;
 
 	cpus_read_lock();
 
-	cpumask_copy(&sched_core_mask, cpu_online_mask);
-	for_each_cpu(cpu, &sched_core_mask) {
-		const struct cpumask *smt_mask = cpu_smt_mask(cpu);
+	/* First update every online SMT sibling group */
+	for_each_online_cpu(cpu) {
+		const struct cpumask *smt = cpu_smt_mask(cpu);
 
+		/* Lock on the "leader" for this SMT mask */
 		sched_core_lock(cpu, &flags);
 
-		for_each_cpu(t, smt_mask)
-			cpu_rq(t)->core_enabled = enabled;
+		for_each_cpu(sib, smt)
+			cpu_rq(sib)->core_enabled = enabled;
 
+		/* Reset per-core idle accounting */
 		cpu_rq(cpu)->core->core_forceidle_start = 0;
 
 		sched_core_unlock(cpu, &flags);
 
-		cpumask_andnot(&sched_core_mask, &sched_core_mask, smt_mask);
+		/*
+		 * Skip remaining siblings by jumping to the last
+		 * CPU in the SMT mask, which avoids reprocessing.
+		 */
+		cpu = cpumask_last(smt);
 	}
 
-	for_each_cpu_andnot(cpu, cpu_possible_mask, cpu_online_mask)
-		cpu_rq(cpu)->core_enabled = enabled;
+	/*
+	 * Handle possible-but-not-online CPUs (hotplug, ACPI offline)
+	 */
+	for_each_cpu(cpu, cpu_possible_mask)
+		if (!cpu_online(cpu))
+			cpu_rq(cpu)->core_enabled = enabled;
 
 	cpus_read_unlock();
 }
+
 
 static void sched_core_assert_empty(void)
 {
