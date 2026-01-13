@@ -676,26 +676,33 @@ static void update_rq_clock_task(struct rq *rq, s64 delta)
 void update_rq_clock(struct rq *rq)
 {
 	s64 delta;
-	u64 clock;
+	u64 now;
 
 	lockdep_assert_rq_held(rq);
 
-	if (rq->clock_update_flags & RQCF_ACT_SKIP)
-		return;
+	/* Skip entire path if update disabled */
+	if (unlikely(rq->clock_update_flags & RQCF_ACT_SKIP))
+		goto out;
 
-	if (sched_feat(WARN_DOUBLE_CLOCK))
-		WARN_ON_ONCE(rq->clock_update_flags & RQCF_UPDATED);
+	/* Detect double updates */
+	if (sched_feat(WARN_DOUBLE_CLOCK) &&
+	    unlikely(rq->clock_update_flags & RQCF_UPDATED))
+		WARN_ON_ONCE(1);
+
 	rq->clock_update_flags |= RQCF_UPDATED;
 
-	clock = sched_clock_cpu(cpu_of(rq));
-	scx_rq_clock_update(rq, clock);
+	now = sched_clock_cpu(cpu_of(rq));
+	scx_rq_clock_update(rq, now);
 
-	delta = clock - rq->clock;
-	if (delta < 0)
-		return;
-	rq->clock += delta;
+	/* Calculate delta (negative deltas aren't applied) */
+	delta = now - rq->clock;
+	if (likely(delta > 0)) {
+		rq->clock = now;
+		update_rq_clock_task(rq, delta);
+	}
 
-	update_rq_clock_task(rq, delta);
+out:
+	return;
 }
 
 /* updated section */
