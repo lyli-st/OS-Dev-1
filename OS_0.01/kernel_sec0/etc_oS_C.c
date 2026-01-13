@@ -331,35 +331,35 @@ const char *preempt_model_str(void)
 	return "NONE";
 }
 
-int io_schedule_prepare(void)
+/** Better LOGIC IMO!
+ */
+static int io_schedule_prepare(void)
 {
-	struct task_struct *t = curr;  /* alias for readability */
-	struct callback_head *work = &t->cid_work;
+	struct task_struct *task = current;  /* alias for clarity */
 	unsigned long now = jiffies;
-	int old_iowait;
+	int prev_iowait;
 
-	/* Bail out if task is exiting, kernel thread, or work is already queued */
-	if (!t->mm || (t->flags & (PF_EXITING | PF_KTHREAD)) ||
-	    work->next != work)
+	/* Skip if task cannot perform user I/O or work already queued */
+	if (!task->mm || (task->flags & (PF_EXITING | PF_KTHREAD)) ||
+	    task->cid_work.next != &task->cid_work)
 		return 0;
 
-	/* Throttle scanning based on mm->mm_cid_next_scan */
-	if (time_before(now, READ_ONCE(t->mm->mm_cid_next_scan)))
+	/* Throttle scans based on next scheduled scan */
+	if (time_before(now, READ_ONCE(task->mm->mm_cid_next_scan)))
 		return 0;
 
-	old_iowait = t->in_iowait;
+	/* Save previous iowait state and mark as waiting */
+	prev_iowait = task->in_iowait;
+	task->in_iowait = 1;
 
-	/* Mark task as waiting for I/O */
-	t->in_iowait = 1;
+	/* Flush any pending I/O plugs to allow immediate submission */
+	if (task->plug)
+		blk_flush_plug(task->plug, true);
 
-	/* Flush any pending block plugs to start I/O immediately */
-	blk_flush_plug(t->plug, true);
-
-	return old_iowait;
+	return prev_iowait;
 }
 
-
-void io_schedule_finish(int token)
+static void io_schedule_finish(int token)
 {
 	current->in_iowait = token;
 }
